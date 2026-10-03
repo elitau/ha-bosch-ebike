@@ -86,6 +86,17 @@ def test_account_level_entity_of_the_second_entry_is_left_alone():
     assert entity._attr_device_info["name"] == "Account"
 
 
+def test_foreign_device_with_three_part_identifier_does_not_break_setup():
+    # Other integrations may register identifiers that are not (domain, id)
+    # pairs. Unpacking every identifier as a pair raised "too many values to
+    # unpack" and took down every platform of every entry on a real install.
+    foreign = FakeDevice(BIKE, ["entry-a"])
+    foreign.identifiers = {("some_other_domain", "hub", "node-7")}
+    entity = FakeEntity(f"{BIKE}_last_ride_distance", BIKE)
+    _scope([entity], devices=[foreign, FakeDevice(BIKE, ["entry-a"])])
+    assert entity._attr_unique_id == f"entry-b_{BIKE}_last_ride_distance"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

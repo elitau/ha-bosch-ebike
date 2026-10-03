@@ -12,7 +12,10 @@ stays testable with plain fakes (tests/test_shared_bike.py).
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def scope_shared_bike_entities(
@@ -28,15 +31,12 @@ def scope_shared_bike_entities(
         ident
         for device in devices
         if entry_id not in device.config_entries
-        for dom, ident in device.identifiers
-        if dom == domain
+        for ident in _own_identifiers(device.identifiers, domain)
     }
     for entity in entities:
-        bike_ids = {
-            ident
-            for dom, ident in entity._attr_device_info["identifiers"]
-            if dom == domain and ident in claimed
-        }
+        bike_ids = _own_identifiers(
+            entity._attr_device_info["identifiers"], domain
+        ) & claimed
         if not bike_ids:
             continue
         bike_id = bike_ids.pop()
@@ -46,6 +46,16 @@ def scope_shared_bike_entities(
         if device_info.get("name"):
             device_info["name"] = f"{device_info['name']} ({account_label})"
     return entities
+
+
+def _own_identifiers(identifiers: Iterable[tuple], domain: str) -> set[str]:
+    """Return the ids of this domain's (domain, id) pairs.
+
+    Other integrations may register identifiers that are not pairs, so never
+    unpack blindly - one foreign three-part identifier would otherwise break
+    every platform's setup.
+    """
+    return {t[1] for t in identifiers if len(t) == 2 and t[0] == domain}
 
 
 def scope_for_entry(hass: Any, entry: Any, entities: list[Any]) -> list[Any]:
@@ -60,10 +70,16 @@ def scope_for_entry(hass: Any, entry: Any, entities: list[Any]) -> list[Any]:
 
     from .const import DOMAIN
 
-    return scope_shared_bike_entities(
-        entities,
-        dr.async_get(hass).devices.values(),
-        entry_id=entry.entry_id,
-        account_label=entry.title or entry.entry_id[:8],
-        domain=DOMAIN,
-    )
+    try:
+        return scope_shared_bike_entities(
+            entities,
+            iter(dr.async_get(hass).devices),
+            entry_id=entry.entry_id,
+            account_label=entry.title or entry.entry_id[:8],
+            domain=DOMAIN,
+        )
+    except Exception:  # noqa: BLE001 - never let this take down a platform
+        # Worst case the second account's entities collide again, as they did
+        # before this module existed; the main user's entities must load.
+        _LOGGER.exception("Bosch eBike: shared-bike scoping failed, skipping it")
+        return entities
