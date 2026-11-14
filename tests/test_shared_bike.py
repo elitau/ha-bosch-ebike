@@ -59,6 +59,16 @@ def test_unique_id_taken_by_another_entry_gets_entry_scoped():
     assert entity._attr_unique_id == f"entry-b_{UID}"
 
 
+def test_new_sensor_of_a_bike_held_by_another_entry_is_scoped_too():
+    # An update adds a sensor nobody has registered yet. Both entries set up
+    # concurrently, so an exact unique_id match would let whichever entry is
+    # faster grab the plain ID. The bike as a whole belongs to the entry that
+    # already holds its other unique_ids.
+    entity = FakeEntity(f"{BIKE}_brand_new_sensor", BIKE)
+    _scope([entity], taken=[UID], entry_id="entry-b")
+    assert entity._attr_unique_id == f"entry-b_{BIKE}_brand_new_sensor"
+
+
 def test_scoped_entity_gets_its_own_device():
     entity = FakeEntity(UID, BIKE)
     _scope([entity], taken=[UID], entry_id="entry-b")

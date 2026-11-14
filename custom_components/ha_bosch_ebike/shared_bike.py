@@ -43,9 +43,21 @@ def scope_shared_bike_entities(
     account_label: str,
     domain: str,
 ) -> list[Any]:
-    """Re-scope entities whose unique_id another config entry already holds."""
+    """Re-scope entities of bikes whose unique_ids another config entry holds.
+
+    Decided per bike, not per unique_id: a sensor added by an update is not
+    registered by anyone yet, and both entries set up concurrently, so an
+    exact match would hand its plain ID to whichever entry is faster.
+    """
     for entity in entities:
-        if entity._attr_unique_id not in taken_unique_ids:
+        bike_ids = [
+            t[1] for t in entity._attr_device_info["identifiers"] if _is_own(t, domain)
+        ]
+        if not any(
+            uid.startswith(f"{bike_id}_")
+            for bike_id in bike_ids
+            for uid in taken_unique_ids
+        ):
             continue
         entity._attr_unique_id = f"{entry_id}_{entity._attr_unique_id}"
         device_info = entity._attr_device_info
