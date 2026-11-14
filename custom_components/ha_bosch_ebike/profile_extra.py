@@ -79,6 +79,9 @@ ASSIST_MODE_NAMES: dict[str, str] = {
     # literal letter "O", and the corrected code fits the established
     # AAB0-for-eMTB pattern exactly).
     "A100E3AAB0": "eMTB",
+    # Cargo Line drive unit BDU374Y: the dedicated CARGO mode (reported by
+    # @jaakode, issue #37).
+    "A100E00009": "CARGO",
 }
 
 
@@ -156,6 +159,49 @@ def reachable_ranges(bike: dict) -> list[dict]:
     return out
 
 
+def _km_text(value: float) -> str:
+    """62.0 -> "62", 62.5 -> "62.5" (reachable_ranges() rounds to one decimal)."""
+    text = f"{value:.1f}"
+    return text[:-2] if text.endswith(".0") else text
+
+
+def reachable_range_band(bike: dict) -> dict | None:
+    """Bosch's reachable range across all assist modes as one band, km.
+
+    The Flow app shows it as "40 to 84 km (Turbo to Eco)": the lowest and the
+    highest of the per-mode figures from :func:`reachable_ranges`. Without it
+    a rider who wants one answer to "how far can I get" has to compare four
+    sensors. Like them it follows the bike's last sync, so it can trail the
+    app by a few kilometres.
+
+    ``text`` is what the sensor shows ("37\u201380 km", or "60 km" when all modes
+    agree). ``min_modes`` / ``max_modes`` name every mode at either end, since
+    ties are common (eMTB and Turbo often report the same figure). ``ranges``
+    keeps every mode in API order; two modes that share a display name keep
+    the higher figure. None when the bike reports no per-mode range (eBike
+    System 2, or nothing yet).
+    """
+    ranges = reachable_ranges(bike)
+    if not ranges:
+        return None
+    by_mode: dict[str, float] = {}
+    for r in ranges:
+        by_mode[r["name"]] = max(r["range_km"], by_mode.get(r["name"], r["range_km"]))
+    lo = min(by_mode.values())
+    hi = max(by_mode.values())
+    text = (
+        f"{_km_text(lo)} km" if lo == hi else f"{_km_text(lo)}\u2013{_km_text(hi)} km"
+    )
+    return {
+        "min_km": lo,
+        "max_km": hi,
+        "text": text,
+        "min_modes": [name for name, km in by_mode.items() if km == lo],
+        "max_modes": [name for name, km in by_mode.items() if km == hi],
+        "ranges": by_mode,
+    }
+
+
 def next_service_date(bike: dict) -> datetime | None:
     """Parse serviceDue.date (handles trailing Z); None if missing/unparseable."""
     raw = _get(bike, "serviceDue", "date")
@@ -223,7 +269,7 @@ def bike_label(bike: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Digital Service Book — GET /service-book/smart-system/v1/service-records
+# Digital Service Book — GET /service-book/smart-system/{v2,v1}/service-records
 # ---------------------------------------------------------------------------
 
 def _newest_record(service_records: dict | None, record_type: str) -> dict | None:
@@ -237,12 +283,20 @@ def _newest_record(service_records: dict | None, record_type: str) -> dict | Non
                key=lambda r: str(_get(r, "attributes", "createdAt", default="")))
 
 
+# Record type of a dealer's battery capacity measurement. The Data Act
+# documentation names it BBP_MEASUREMENT (the v1 appendix and the v2 spec
+# alike). Up to 1.19.61 this looked for BATTERY_MEASUREMENT, a name that is in
+# neither, so the state of health sensors could never fill. Both are accepted:
+# the old name costs nothing.
+_BATTERY_MEASUREMENT_TYPES = ("BBP_MEASUREMENT", "BATTERY_MEASUREMENT")
+
+
 def battery_soh(service_records: dict | None, serial: str) -> dict | None:
-    """Newest BATTERY_MEASUREMENT for the given battery serialNumber."""
+    """Newest battery measurement record for the given battery serialNumber."""
     recs = _get(service_records, "serviceRecords", default=[]) or []
     matching = [
         r for r in recs
-        if isinstance(r, dict) and r.get("type") == "BATTERY_MEASUREMENT"
+        if isinstance(r, dict) and r.get("type") in _BATTERY_MEASUREMENT_TYPES
         and _get(r, "attributes", "details", "batteryMeasurement",
                  "battery", "serialNumber") == serial
     ]

@@ -16,6 +16,7 @@ profile_extra = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(profile_extra)
 
 reachable_ranges = profile_extra.reachable_ranges
+reachable_range_band = profile_extra.reachable_range_band
 next_service_date = profile_extra.next_service_date
 theft_status = profile_extra.theft_status
 frame_number = profile_extra.frame_number
@@ -55,6 +56,75 @@ def test_reachable_ranges_maps_codes_to_display_names_in_order():
         {"name": "eMTB+", "range_km": 30.0},
         {"name": "TURBO", "range_km": 27.0},
     ]
+
+
+def _bike_with_ranges(*pairs):
+    """A bike whose active modes report the given (code, reachableRange) pairs."""
+    return {"driveUnit": {"activeAssistModes": [
+        {"name": code, "reachableRange": rng} for code, rng in pairs
+    ]}}
+
+
+def test_range_band_runs_from_the_lowest_to_the_highest_mode():
+    # The Flow app shows it as "27 to 49 km (Turbo to Eco)".
+    band = reachable_range_band(BIKE)
+    assert band["min_km"] == 27.0
+    assert band["max_km"] == 49.0
+    assert band["text"] == "27\u201349 km"
+    assert band["min_modes"] == ["TURBO"]
+    assert band["max_modes"] == ["ECO"]
+    # every mode, in API order, so nothing has to be looked up elsewhere
+    assert list(band["ranges"].items()) == [
+        ("ECO", 49.0), ("TOUR", 36.0), ("AUTO", 33.0), ("eMTB+", 30.0), ("TURBO", 27.0),
+    ]
+
+
+def test_range_band_names_every_mode_on_a_tie():
+    # A real report (issue #78): ECO 80, TOUR 62, eMTB 37 and TURBO 37, where
+    # Flow showed 39 to 83. Both modes at the bottom are named, not just one.
+    band = reachable_range_band(_bike_with_ranges(
+        ("A100M00040", 80), ("A100M00030", 62), ("A100MSPIC7", 37), ("A100M00010", 37),
+    ))
+    assert band["text"] == "37\u201380 km"
+    assert band["min_modes"] == ["eMTB+", "TURBO"]
+    assert band["max_modes"] == ["ECO"]
+
+
+def test_range_band_collapses_to_one_figure_when_all_modes_agree():
+    band = reachable_range_band(_bike_with_ranges(
+        ("A100M00040", 60), ("A100M00030", 60), ("A100M00010", 60),
+    ))
+    assert band["text"] == "60 km"
+    assert band["min_km"] == band["max_km"] == 60.0
+    assert band["min_modes"] == band["max_modes"] == ["ECO", "TOUR", "TURBO"]
+
+
+def test_range_band_keeps_a_fraction_and_drops_a_trailing_zero():
+    band = reachable_range_band(_bike_with_ranges(("A100M00040", 62.5), ("A100M00010", 40)))
+    assert band["text"] == "40\u201362.5 km"
+
+
+def test_range_band_keeps_the_higher_figure_when_two_modes_share_a_name():
+    # Never seen on a real bike, but the band must not contradict its own
+    # "ranges": two codes that map to the same display name collapse to the
+    # higher figure, and min/max/modes are derived from what is listed.
+    band = reachable_range_band(_bike_with_ranges(
+        ("A100M0AUTO", 33), ("A100G0AUTO", 40), ("A100M00010", 27),
+    ))
+    assert band["ranges"] == {"AUTO": 40.0, "TURBO": 27.0}
+    assert band["min_km"] == 27.0 and band["max_km"] == 40.0
+    assert band["min_modes"] == ["TURBO"] and band["max_modes"] == ["AUTO"]
+    assert band["text"] == "27\u201340 km"
+
+
+def test_range_band_is_none_without_a_readable_range():
+    assert reachable_range_band({}) is None
+    assert reachable_range_band({"driveUnit": {}}) is None
+    assert reachable_range_band({"driveUnit": {"activeAssistModes": []}}) is None
+    # modes without a numeric reachableRange are skipped, like reachable_ranges()
+    assert reachable_range_band(_bike_with_ranges(("A100M00040", None))) is None
+    band = reachable_range_band(_bike_with_ranges(("A100M00040", None), ("A100M00010", 27)))
+    assert band["text"] == "27 km"
 
 
 def test_assist_mode_display_name_mapping_and_fallback():
@@ -222,6 +292,15 @@ def test_assist_mode_display_name_weirdojules_emtb_code():
     assert assist_mode_display_name("A100E3AAB0") == "eMTB"
 
 
+def test_assist_mode_display_name_cargo_line_code():
+    # Cargo Line drive unit BDU374Y, reported by @jaakode in issue #37.
+    assert assist_mode_display_name("A100E00009") == "CARGO"
+    # and it comes through as a named range sensor, not as a raw code
+    assert reachable_ranges({"driveUnit": {"activeAssistModes": [
+        {"name": "A100E00009", "reachableRange": 55}]}}) == [
+            {"name": "CARGO", "range_km": 55.0}]
+
+
 def test_reachable_ranges_unknown_code_kept_raw():
     assert reachable_ranges({"driveUnit": {"activeAssistModes": [
         {"name": "A100M99999", "reachableRange": 42}]}}) == [
@@ -355,8 +434,8 @@ def test_bike_label_missing_drive_unit_defaults_to_ebike():
 # Service Book — battery_soh
 # ---------------------------------------------------------------------------
 
-def _battery_record(serial, created_at, soh):
-    return {"id": serial + created_at, "type": "BATTERY_MEASUREMENT",
+def _battery_record(serial, created_at, soh, record_type="BATTERY_MEASUREMENT"):
+    return {"id": serial + created_at, "type": record_type,
             "attributes": {"createdAt": created_at,
                 "details": {"batteryMeasurement": {
                     "battery": {"serialNumber": serial, "partNumber": "PN",
@@ -392,6 +471,34 @@ def test_battery_soh_newest_created_at_wins():
         _battery_record("ABC", "2026-05-01T00:00:00Z", 80),
     ]}
     assert battery_soh(recs, "ABC")["soh_pct"] == 80
+
+
+def test_battery_soh_accepts_the_documented_bbp_measurement_type():
+    # The Data Act documentation (the v1 appendix and the v2 spec alike) names
+    # the record BBP_MEASUREMENT; 1.19.61 and earlier only looked for
+    # BATTERY_MEASUREMENT, a name that is in neither.
+    recs = {"serviceRecords": [
+        _battery_record("ABC", "2026-01-01T00:00:00Z", 90, record_type="BBP_MEASUREMENT")]}
+    assert battery_soh(recs, "ABC") == {
+        "soh_pct": 90, "measured_wh": 450, "nominal_wh": 500,
+        "full_charge_cycles": 100, "measured_at": "2026-01-01T00:00:00Z"}
+
+
+def test_battery_soh_newest_wins_across_both_type_names():
+    recs = {"serviceRecords": [
+        _battery_record("ABC", "2026-01-01T00:00:00Z", 90, record_type="BATTERY_MEASUREMENT"),
+        _battery_record("ABC", "2026-05-01T00:00:00Z", 80, record_type="BBP_MEASUREMENT"),
+        _battery_record("ABC", "2026-03-01T00:00:00Z", 85, record_type="BATTERY_MEASUREMENT"),
+    ]}
+    assert battery_soh(recs, "ABC")["soh_pct"] == 80
+
+
+def test_battery_soh_ignores_records_of_other_types():
+    recs = {"serviceRecords": [
+        _battery_record("ABC", "2026-01-01T00:00:00Z", 90, record_type="INSPECTION"),
+        _battery_record("ABC", "2026-02-01T00:00:00Z", 91, record_type="CUSTOMER_REPORT"),
+    ]}
+    assert battery_soh(recs, "ABC") is None
 
 
 # ---------------------------------------------------------------------------

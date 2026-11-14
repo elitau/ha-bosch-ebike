@@ -51,6 +51,7 @@ from .profile_extra import (
     last_service,
     max_altitude,
     next_service_date,
+    reachable_range_band,
     reachable_ranges,
 )
 from .diagnosis_field_data import (
@@ -58,6 +59,7 @@ from .diagnosis_field_data import (
     capacity_test_summary,
     drive_unit_field_data,
 )
+from .range_estimate import range_estimate_attributes
 from .unassigned_activities import ATTRIBUTE_DISPLAY_LIMIT
 
 _LOGGER = logging.getLogger(__name__)
@@ -824,6 +826,11 @@ async def async_setup_entry(
             entities.append(
                 BoschReachableRangeSensor(coordinator, bike_id, drive_name, idx, mode_name)
             )
+        # The same figures as one value, the way the Flow app shows them
+        # ("40 to 84 km"). Created whenever the per-mode sensors are, so it
+        # never exists for eBike System 2 (no per-mode range there).
+        if reachable_ranges(bike):
+            entities.append(BoschReachableRangeBandSensor(coordinator, bike_id, drive_name))
 
         # Per-assist-mode lifetime distance/energy stats from the newest customer
         # report (service book). These only exist when a dealer customer report is
@@ -906,6 +913,12 @@ async def async_setup_entry(
         # BoschChargedEnergySensor for which of the two owns it.
         if soc_entity:
             monitor = ChargeSessionMonitor(hass, coordinator, bike_id, soc_entity)
+            # A charge that was running when Home Assistant last stopped is
+            # picked up again here, before any entity exists. The sensors
+            # then restore their own state on top of it, which is safe in
+            # either order (see ChargeSessionTracker.restore_summary and
+            # restore_total_energy).
+            await monitor.async_restore()
             # Tied to the config entry, not to an entity: see charge_monitor.py
             # for why the subscription must outlive either sensor being
             # disabled in the entity registry.
@@ -954,8 +967,8 @@ async def async_setup_entry(
         # Maintenance overview (count of items due/overdue + full list as attributes)
         entities.append(BoschMaintenanceOverviewSensor(coordinator, bike_id, drive_name))
 
-    # Account-level diagnostic: activities the odometer-based attribution
-    # could not match to any bike. Only meaningful (and only ever non-empty)
+    # Account-level diagnostic: activities the attribution (the bikeId Bosch
+    # delivers, else the odometer) could not match to any bike. Only meaningful (and only ever non-empty)
     # for multi-bike Smart System accounts.
     if not is_bes2 and len(bikes) > 1:
         entities.append(
@@ -973,10 +986,24 @@ def _create_battery_sensors(
     prefix: str,
     bat_name: str,
 ) -> list[BoschEBikeSensor]:
-    """Create sensor entities for a single battery."""
+    """Create sensor entities for a single battery.
+
+    The translation keys are there so that a card (or any script reading the
+    entity registry) can find these sensors without relying on their entity
+    IDs, which Home Assistant keeps from the time the entity was created and
+    which users rename. They are deliberately the same for every battery of a
+    bike: what tells two batteries apart is the product name in the entity
+    name and the battery number in the unique ID, so a reader that wants the
+    total over a bike has to collect every entity of the device with that key.
+
+    There is deliberately no entry for these keys in strings.json: with
+    has_entity_name Home Assistant would show the translated name instead of
+    the literal one below, and that would drop the battery's product name.
+    """
     descs = [
         BoschBikeSensorDescription(
             key=f"{prefix}_wh_lifetime",
+            translation_key="battery_wh_lifetime",
             name=f"{bat_name} Wh Lifetime",
             native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
             device_class=SensorDeviceClass.ENERGY,
@@ -986,6 +1013,7 @@ def _create_battery_sensors(
         ),
         BoschBikeSensorDescription(
             key=f"{prefix}_charge_cycles_total",
+            translation_key="battery_charge_cycles",
             name=f"{bat_name} Charge Cycles",
             icon="mdi:battery-sync",
             state_class=SensorStateClass.TOTAL_INCREASING,
@@ -993,6 +1021,7 @@ def _create_battery_sensors(
         ),
         BoschBikeSensorDescription(
             key=f"{prefix}_charge_cycles_on_bike",
+            translation_key="battery_cycles_on_bike",
             name=f"{bat_name} Cycles On Bike",
             icon="mdi:battery-sync",
             state_class=SensorStateClass.TOTAL_INCREASING,
@@ -1000,6 +1029,7 @@ def _create_battery_sensors(
         ),
         BoschBikeSensorDescription(
             key=f"{prefix}_charge_cycles_off_bike",
+            translation_key="battery_cycles_off_bike",
             name=f"{bat_name} Cycles Off Bike",
             icon="mdi:battery-sync",
             state_class=SensorStateClass.TOTAL_INCREASING,
@@ -1082,6 +1112,8 @@ class BoschEBikeSensor(CoordinatorEntity[BoschEBikeCoordinator], SensorEntity):
     def native_value(self) -> Any:
         """Return the sensor value."""
         if self.entity_description.is_aggregate:
+            if self.coordinator.activities_unknown:
+                return None
             activities = _activities_for_bike(self.coordinator.data, self._bike_id)
             return self.entity_description.value_fn(activities)
 
@@ -1185,6 +1217,61 @@ class BoschReachableRangeSensor(CoordinatorEntity[BoschEBikeCoordinator], Sensor
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose the assist mode this range belongs to."""
         return {"assist_mode": self._mode_name}
+
+
+class BoschReachableRangeBandSensor(CoordinatorEntity[BoschEBikeCoordinator], SensorEntity):
+    """Bosch's reachable range across all assist modes as one value, like Flow.
+
+    The state is text ("37\u201380 km": lowest to highest mode), so it has no unit
+    or device class and does not graph; the numbers are in the attributes
+    (min_km, max_km) and in the per-mode sensors it summarises. Like those it
+    follows the bike's last sync (see profile_extra.reachable_range_band).
+
+    A literal name without "reachable_range" in it, on purpose: the dashboard
+    card picks the per-mode pills out of the states by that part of the
+    entity_id, and this one is not a mode.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:map-marker-distance"
+    _attr_name = "Range Band"
+
+    def __init__(
+        self,
+        coordinator: BoschEBikeCoordinator,
+        bike_id: str,
+        drive_name: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._bike_id = bike_id
+        self._attr_unique_id = f"{bike_id}_range_band"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, bike_id)},
+            name=drive_name,
+            manufacturer="Bosch",
+            model=drive_name,
+        )
+
+    def _band(self) -> dict[str, Any] | None:
+        for bike in self.coordinator.data.get("bikes", []):
+            if bike.get("id") == self._bike_id:
+                return reachable_range_band(bike)
+        return None
+
+    @property
+    def native_value(self) -> str | None:
+        band = self._band()
+        return band["text"] if band else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        band = self._band()
+        if not band:
+            return None
+        return {
+            key: band[key]
+            for key in ("min_km", "max_km", "min_modes", "max_modes", "ranges")
+        }
 
 
 class BoschBatterySohSensor(CoordinatorEntity[BoschEBikeCoordinator], SensorEntity):
@@ -1689,11 +1776,14 @@ class BoschMaxAltitudeSensor(CoordinatorEntity[BoschEBikeCoordinator], SensorEnt
     """Max altitude of this bike's own latest ride.
 
     Reads coordinator.data["latest_activity_details_by_bike"][bike_id] and
-    returns profile_extra.max_altitude(details) in metres. Uses a literal
-    name, so no translation_key is required.
+    returns profile_extra.max_altitude(details) in metres. The name is a
+    literal one; the translation key only lets a card find the sensor without
+    relying on its entity ID, like the other last_ride_* sensors. It has no
+    entry in strings.json on purpose, so the name stays as it is.
     """
 
     _attr_has_entity_name = True
+    _attr_translation_key = "last_ride_max_altitude"
     _attr_native_unit_of_measurement = UnitOfLength.METERS
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:image-filter-hdr"
@@ -1904,10 +1994,7 @@ class BoschRangeEstimateSensor(CoordinatorEntity[BoschEBikeCoordinator], SensorE
             return {"disclaimer": RANGE_DISCLAIMER}
         return {
             "disclaimer": RANGE_DISCLAIMER,
-            "wh_per_km": est.get("wh_per_km"),
-            "tours_used": est.get("tours_used"),
-            "window_km": est.get("window_km"),
-            "newest_tour_date": est.get("newest_tour_date"),
+            **range_estimate_attributes(est),
             "battery_capacity_wh": self.coordinator.battery_capacity_wh(self._bike_id),
         }
 
@@ -2020,10 +2107,11 @@ class BoschChargeSessionSensor(RestoreEntity, SensorEntity):
         await super().async_added_to_hass()
 
         # Bring back the last completed charge, so a restart does not blank
-        # out last night's summary. An in-flight charge is deliberately not
-        # restored - see ChargeSessionTracker.restore_summary. Read from the
-        # ATTRIBUTES, which Home Assistant stores verbatim; the state string
-        # would be unit-converted (see BoschChargedEnergySensor).
+        # out last night's summary. A charge that was still running is not
+        # part of this: ChargeSessionMonitor.async_restore picks that up
+        # from its own store. Read from the ATTRIBUTES, which Home Assistant
+        # stores verbatim; the state string would be unit-converted (see
+        # BoschChargedEnergySensor).
         last_state = await self.async_get_last_state()
         if last_state is not None:
             restored = {

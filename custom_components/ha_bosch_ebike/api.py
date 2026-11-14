@@ -20,6 +20,7 @@ from .const import (
     ACTIVITIES_ENDPOINT,
     BIKE_PASS_ENDPOINT,
     SERVICE_RECORDS_ENDPOINT,
+    SERVICE_RECORDS_V2_ENDPOINT,
     SYSTEM_SMART,
     SYSTEM_BES2,
     BES2_KC_IDP_HINT,
@@ -31,6 +32,9 @@ from .const import (
     DRIVE_UNITS_PATH_CANDIDATES,
 )
 
+from .oauth_error import rejection_reason
+from .token_info import token_scope
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -40,6 +44,10 @@ class BoschEBikeAPI:
     # Single shared timeout for every Bosch cloud request. Without it a hung
     # connection would block the coordinator poll indefinitely.
     _TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+    # Once the Digital Service Book had to be read from v1, v2 is only tried
+    # again this often (see get_service_records).
+    _SERVICE_BOOK_V2_RECHECK_INTERVAL_S = 24 * 60 * 60
 
     def __init__(
         self,
@@ -62,6 +70,12 @@ class BoschEBikeAPI:
         # if a later release reorders the candidate list.
         self._discovered_paths: dict[str, str] = {}
         self._unresolved_since: dict[str, float] = {}
+        # Which Digital Service Book API version answered last ("v2" or "v1",
+        # None before the first request) and when v2 last failed, so that a v1
+        # verdict does not cost a failing v2 request on every poll. In memory
+        # only, like the discovery cache above.
+        self._service_book_version: str | None = None
+        self._service_book_v2_failed_at: float = 0.0
 
     # -- PKCE helpers --
 
@@ -131,6 +145,21 @@ class BoschEBikeAPI:
             "refresh_token": self._refresh_token,
         }
         async with self._session.post(TOKEN_URL, data=data, timeout=self._TIMEOUT) as resp:
+            if resp.status >= 400:
+                # A refused login is not a failed request: the stored refresh
+                # token, or the Client-ID itself, is no longer valid and only a
+                # new sign-in helps. As an AuthError this starts the
+                # re-authentication; as the ClientResponseError that
+                # raise_for_status() makes of it, the setup retried forever
+                # without ever asking (issue #98). Read the reply before
+                # raising; failing to read it must not hide the status.
+                try:
+                    body = (await resp.text())[:500]
+                except Exception:  # noqa: BLE001
+                    body = ""
+                reason = rejection_reason(resp.status, body)
+                if reason is not None:
+                    raise AuthError(f"Bosch rejected the refresh token ({reason})")
             resp.raise_for_status()
             tokens = await resp.json()
         self._access_token = tokens["access_token"]
@@ -145,6 +174,16 @@ class BoschEBikeAPI:
     @property
     def refresh_token(self) -> str | None:
         return self._refresh_token
+
+    @property
+    def service_book_version(self) -> str | None:
+        """Digital Service Book API version that answered last, for the diagnostics."""
+        return self._service_book_version
+
+    @property
+    def access_token_scope(self) -> str | None:
+        """Scope claim of the current access token, for log lines only."""
+        return token_scope(self._access_token)
 
     def set_tokens(self, access_token: str, refresh_token: str | None) -> None:
         """Set tokens from stored config entry."""
@@ -164,7 +203,23 @@ class BoschEBikeAPI:
                 _LOGGER.debug("401 received, refreshing token")
                 await self.refresh_access_token()
                 return await self._get(path, retry_on_401=False)
-            resp.raise_for_status()
+            if resp.status >= 400:
+                # raise_for_status() keeps only the status line, but Bosch's
+                # own reply is what tells an outage from a revoked consent or
+                # a moved endpoint (issue #95 was a bare "404 Not Found" on
+                # the activity list). Keep a short piece of it on the
+                # exception so the coordinator can put it in the log. Read it
+                # here, before raising; a failure to read must never replace
+                # the status error itself.
+                try:
+                    body = (await resp.text())[:300]
+                except Exception:  # noqa: BLE001
+                    body = ""
+                try:
+                    resp.raise_for_status()
+                except aiohttp.ClientResponseError as err:
+                    err.body = body
+                    raise
             return await resp.json()
 
     _PATH_UNRESOLVED = "__unresolved__"
@@ -348,8 +403,57 @@ class BoschEBikeAPI:
         return await self._get(f"{BIKE_PASS_ENDPOINT}?bikeId={bike_id}")
 
     async def get_service_records(self, bike_id: str) -> dict[str, Any]:
-        """Digital Service Book records (battery measurements, customer reports) for one bike."""
-        return await self._get(f"{SERVICE_RECORDS_ENDPOINT}?bikeId={bike_id}")
+        """Digital Service Book records (battery measurements, customer reports) for one bike.
+
+        Bosch published v2 of this API (spec 2.0.3). It is a superset of v1,
+        nothing was removed or renamed, and v1 still answered when v2 came
+        out; nothing says for how long. So v2 is tried first, and v1 is the
+        fallback whenever v2 does not deliver: any HTTP error, an unreadable
+        body, and also an answer without a single record. The last one
+        matters because the spec says an empty list is what v2 returns when
+        it has no data for a bike, which is also what a v2 that was not filled
+        for this account yet would say, while v1 may still hold the records.
+        A v2 that is not live, wants something v1 does not, or is empty must
+        never cost the data v1 still delivers. If v1 has nothing either, its
+        (empty) answer is the answer.
+
+        The version that worked is remembered. Once v1 had to be used, v2 is
+        only tried again every _SERVICE_BOOK_V2_RECHECK_INTERVAL_S, so there
+        is no extra request per poll, and a v2 that starts delivering later
+        is still picked up.
+
+        An auth error is not a version problem and propagates; so does a
+        network failure, which would hit v1 just the same.
+        """
+        query = f"?bikeId={bike_id}"
+        now = time.monotonic()
+        if (
+            self._service_book_version != "v1"
+            or now - self._service_book_v2_failed_at
+            >= self._SERVICE_BOOK_V2_RECHECK_INTERVAL_S
+        ):
+            try:
+                data = await self._get(f"{SERVICE_RECORDS_V2_ENDPOINT}{query}")
+            except AuthError:
+                raise
+            except (aiohttp.ClientResponseError, ValueError) as err:
+                reason = f"{type(err).__name__}: {err}"
+            else:
+                if isinstance(data, dict) and data.get("serviceRecords"):
+                    if self._service_book_version != "v2":
+                        _LOGGER.info("Bosch eBike: the Digital Service Book is read from API v2")
+                    self._service_book_version = "v2"
+                    return data
+                reason = "no records"
+            if self._service_book_version != "v1":
+                _LOGGER.info(
+                    "Bosch eBike: Digital Service Book API v2 did not deliver (%s); "
+                    "using v1 and trying v2 again in %d hours",
+                    reason, self._SERVICE_BOOK_V2_RECHECK_INTERVAL_S // 3600,
+                )
+            self._service_book_version = "v1"
+            self._service_book_v2_failed_at = now
+        return await self._get(f"{SERVICE_RECORDS_ENDPOINT}{query}")
 
     # -- eBike System 2 (BES2) API calls --
 

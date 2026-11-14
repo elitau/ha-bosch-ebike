@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from .const import (
     CONF_BES2_PART,
 )
 from .coordinator import BoschEBikeCoordinator
+from .device_lookup import device_for_identifier
 from .profile_extra import bike_label as _bike_label
 
 _LOGGER = logging.getLogger(__name__)
@@ -268,30 +270,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # per-bike, that device has no entities left, but Home Assistant does
     # not auto-prune a device just because it lost its last entity - remove
     # it explicitly. No-op after the first run, once it no longer exists.
-    # Only remove it if it is genuinely empty: async_get_device/
-    # async_remove_device match by identifiers alone with no ownership
-    # check, and HA devices can in principle be shared across config
-    # entries/integrations (manual "combine devices"), so double-check no
-    # entity still points at it before deleting it from the registry.
+    # Only remove it if it is genuinely empty: HA devices can in principle be
+    # shared across config entries/integrations (manual "combine devices"),
+    # so double-check no entity still points at it before deleting it from
+    # the registry.
     device_registry = dr.async_get(hass)
-    ghost_identifier = (DOMAIN, entry.entry_id)
-    if hasattr(device_registry, "async_get_device_by_identifier"):
-        # HA >= 2026.8.0: ownership-scoped lookup, added alongside devices
-        # becoming shareable across config entries. async_get_device is
-        # deprecated as of this version (issue #80), so use the direct
-        # replacement here instead of the ambiguous identifier-only match.
-        ghost_device = device_registry.async_get_device_by_identifier(
-            identifier=ghost_identifier, config_entry_id=entry.entry_id
-        )
-    else:
-        # HA < 2026.8.0: async_get_device_by_identifier does not exist yet,
-        # and async_get_device is not deprecated on these versions either
-        # (the cross-config-entry device sharing it warns about was only
-        # introduced in 2026.8.0). Remove this branch once the project's
-        # minimum supported HA version reaches 2026.8.0.
-        ghost_device = device_registry.async_get_device(
-            identifiers={ghost_identifier}
-        )
+    ghost_device = device_for_identifier(
+        device_registry, (DOMAIN, entry.entry_id), entry.entry_id
+    )
     if ghost_device is not None:
         entity_registry = er.async_get(hass)
         if not er.async_entries_for_device(entity_registry, ghost_device.id):
@@ -301,7 +287,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # entry so entities depending on options (e.g. the current-range
     # sensor) are created/removed immediately. The coordinator — and with
     # it the enrichment cache — is rebuilt as part of the reload.
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+    # Home Assistant fires update listeners for EVERY change to the entry,
+    # and the coordinator writes refreshed tokens back into entry.data about
+    # once an hour, so the listener has to tell those apart from a real
+    # change (issue #89).
+    entry.async_on_unload(entry.add_update_listener(_make_update_listener(entry)))
 
     # Cancel any pending debounced odometer-floor save (issue #60 follow-up)
     # on unload/reload. Without this, an options-triggered reload while a
@@ -313,9 +303,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options updates by reloading the config entry."""
-    await hass.config_entries.async_reload(entry.entry_id)
+# The only entry.data keys that change during normal operation: the
+# coordinator writes a refreshed token pair back after every token refresh.
+_TOKEN_KEYS = ("access_token", "refresh_token")
+
+
+def _reload_relevant_state(entry: ConfigEntry) -> dict:
+    """The part of an entry a reload actually depends on.
+
+    Options plus every data key except the tokens, deep-copied so a later
+    in-place change to a nested option cannot alias the snapshot. Comparing
+    "everything but the tokens" (rather than options alone) keeps a future
+    flow that writes some other data key from silently losing its reload.
+    """
+    return {
+        "options": copy.deepcopy(dict(entry.options)),
+        "data": {
+            k: copy.deepcopy(v) for k, v in entry.data.items()
+            if k not in _TOKEN_KEYS
+        },
+    }
+
+
+def _make_update_listener(entry: ConfigEntry):
+    """Build the entry update listener for this setup of the entry.
+
+    Reloading on every update meant every token refresh (about hourly) tore
+    down the whole entry: all entities went unavailable, a charge in progress
+    was dropped by its tracker, and the full activity history was imported
+    again, because the coordinator's "initial import done" flag only lives in
+    memory (issue #89). The snapshot is taken per setup, so every reload
+    re-registers a listener that compares against the options in force now.
+    """
+    snapshot = _reload_relevant_state(entry)
+
+    async def _async_entry_updated(hass: HomeAssistant, updated: ConfigEntry) -> None:
+        if _reload_relevant_state(updated) == snapshot:
+            return
+        await hass.config_entries.async_reload(updated.entry_id)
+
+    return _async_entry_updated
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -377,7 +404,7 @@ async def ws_list_instances(
             # editors, since they all resolve their options through this
             # same WS call. Mirrors BoschEBikeOptionsFlowHandler's
             # _display_name_for_bike() in config_flow.py.
-            device = device_registry.async_get_device(identifiers={(DOMAIN, bid)})
+            device = device_for_identifier(device_registry, (DOMAIN, bid), entry_id)
             if device and (device.name_by_user or device.name):
                 label = device.name_by_user or device.name
             else:
@@ -482,9 +509,9 @@ async def ws_assign_activity(
     Same persisted override mechanism the options flow's assignment wizard
     uses (see coordinator.async_assign_activities and
     unassigned_activities.merge_manual_overrides): a manual assignment
-    always wins over the odometer heuristic, so this also CORRECTS rides
-    the heuristic confidently but wrongly attributed - not just ones it
-    could not attribute at all, which is all the wizard ever offered.
+    always wins over the automatic attribution, so this also CORRECTS rides
+    that were confidently but wrongly attributed - not just ones that
+    could not be attributed at all, which is all the wizard ever offered.
     """
     activity_id = msg["activity_id"]
     bike_id = msg["bike_id"]
@@ -591,6 +618,20 @@ async def ws_get_track(
         connection.send_error(msg["id"], "fetch_error", str(err))
 
 
+def _track_cache_tag(activity: dict) -> tuple:
+    """What a cached heatmap track was valid for.
+
+    The per-activity track cache has no expiry. It used to be emptied
+    incidentally by the hourly entry reload (issue #89); now it lives until
+    Home Assistant restarts, so a stale entry has to be recognised instead.
+    A ride whose track was still uploading when it was cached gets its
+    distance corrected once the full track arrives, and a BES2 trip that
+    gains a ride changes its ride count (its whole-trip fallback route grows).
+    Either change makes the entry refetch.
+    """
+    return (activity.get("distance"), activity.get("_bes2_ride_count"))
+
+
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "bosch_ebike/get_all_tracks",
@@ -676,13 +717,23 @@ async def ws_get_all_tracks(
                 return
 
         cache = coord._all_tracks_cache
-        points = cache.get(aid)
+        tag = _track_cache_tag(activity)
+        cached = cache.get(aid)
+        points = cached[1] if cached is not None and cached[0] == tag else None
         if points is None:
             async with semaphore:
                 try:
                     detail = await coord.fetch_track_detail(aid)
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.warning("Bosch eBike: get_all_tracks: failed to load %s: %s", aid, err)
+                    return
+                # A BES2 trip with several rides whose track data cannot be
+                # told apart per ride (issue #88) comes back as the WHOLE
+                # trip's route for each of its rides. Only the trip's first
+                # ride may draw it, or the same route repeats once per ride.
+                # The empty entry is cached so a repeat call skips the fetch.
+                if detail.get("scope") == "trip" and detail.get("primary") is False:
+                    cache[aid] = (tag, [])
                     return
                 raw = detail.get("activityDetails", [])
                 points = []
@@ -696,7 +747,7 @@ async def ws_get_all_tracks(
                         "lon": lon,
                         "speed": p.get("speed"),
                     })
-                cache[aid] = points
+                cache[aid] = (tag, points)
 
         if not points:
             return

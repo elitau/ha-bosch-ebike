@@ -5,13 +5,13 @@
 
 > [Deutsch](README.md) | [English](README.md#english) | [Nederlands](README.nl.md) | [Français](README.fr.md) | **Italiano** | [Español](README.es.md) | [Čeština](README.cs.md)
 
-> **⚠️ Nota di aggiornamento (da v1.17.6):** La cartella dell'integrazione ora si chiama `ha_bosch_ebike` (prima `bosch_ebike`). La tua configurazione, i dispositivi e le impostazioni restano invariati. Se dopo l'aggiornamento HACS sono presenti **entrambe** le cartelle in `config/custom_components/`, elimina una volta la vecchia `bosch_ebike` e riavvia Home Assistant.
+> **⚠️ Nota di aggiornamento (da v1.17.6):** La cartella dell'integrazione ora si chiama `ha_bosch_ebike` (prima `bosch_ebike`). La tua configurazione, i dispositivi e le impostazioni restano invariati. Se dopo l'aggiornamento (tramite HACS o Marketplace) sono presenti **entrambe** le cartelle in `config/custom_components/`, elimina una volta la vecchia `bosch_ebike` e riavvia Home Assistant.
 
 > ### ⚠️ Requisito regionale
 > Questa integrazione funziona **esclusivamente con un account Bosch SingleKey-ID registrato all'interno dell'UE**. Utilizza l'API ufficiale Bosch Data Act, la cui disponibilità è limitata agli account UE. Gli account di altre regioni vengono rifiutati dall'endpoint API e l'integrazione non può autenticarsi.
 
 > ### 🔌 Veri dati live via Bluetooth (smart system v19+)
-> Oltre all'integrazione HACS, questo repo contiene anche una **bridge BLE ESPHome** che trasforma un ESP32 in un ponte verso il **Bosch eBike Live Data Interface**. In questo modo SoC della batteria, velocità, chilometraggio & co. arrivano in tempo reale in Home Assistant. Da poco è disponibile anche una **bridge doppia**: un singolo ESP32 si collega così contemporaneamente a due eBike Bosch.
+> Oltre all'integrazione, questo repo contiene anche una **bridge BLE ESPHome** che trasforma un ESP32 in un ponte verso il **Bosch eBike Live Data Interface**. In questo modo SoC della batteria, velocità, chilometraggio & co. arrivano in tempo reale in Home Assistant. Da poco è disponibile anche una **bridge doppia**: un singolo ESP32 si collega così contemporaneamente a due eBike Bosch.
 >
 > 🚀 **Flash senza installare ESPHome**: collega un ESP32 (o ESP32-C3, ad es. "C3 Mini") via USB, apri in Chrome / Edge **[https://xunil99.github.io/ha-bosch-ebike/](https://xunil99.github.io/ha-bosch-ebike/)** e clicca su *Install*. L'installer riconosce automaticamente il chip e flasha il firmware adatto (inclusa la variante bridge doppia). La configurazione Wi-Fi avviene nello stesso passaggio nel browser. Guida completa (DE/EN) incl. abbinamento tramite l'app Flow: [`esphome/`](https://github.com/Xunil99/ha-bosch-ebike/tree/main/esphome).
 >
@@ -125,7 +125,7 @@ Copia la **Client-ID** – ti servirà tra poco.
 
 #### Passo 3: installare l'integrazione in Home Assistant
 
-Installa l'integrazione tramite **HACS** (vedi la sezione più sotto) e riavvia Home Assistant. Solo dopo il link di autorizzazione dell'eBike Manager può aprire il flusso di configurazione.
+Installa l'integrazione tramite il **Marketplace** (da Home Assistant 2026.11, sostituisce HACS) oppure tramite **HACS** (fino alla 2026.10), vedi la sezione più sotto, e riavvia Home Assistant. Solo dopo il link di autorizzazione dell'eBike Manager può aprire il flusso di configurazione.
 
 #### Passo 4: configurare l'integrazione (tramite "Service aktivieren")
 
@@ -186,9 +186,21 @@ L'integrazione include una card Lovelace interattiva per visualizzare le tue tra
 
 > **Nota:** Se dopo un aggiornamento la card non viene visualizzata correttamente, svuota la cache del browser con `Ctrl+Shift+R` (hard reload).
 
-> **Aggiornamento HACS per le card:** Tutte e quattro le card Lovelace (Map, Heatmap, Calendar, Dashboard) si trovano in un unico file JS (`bosch-ebike-map-card.js`) e vengono aggiornate automaticamente insieme all'integrazione. Dopo un aggiornamento di versione da HACS esegui un hard reload della cache del browser, altrimenti il selettore delle card potrebbe non mostrare ancora una nuova card.
+> **Aggiornamento delle card (HACS o Marketplace):** Tutte e quattro le card Lovelace (Map, Heatmap, Calendar, Dashboard) si trovano in un unico file JS (`bosch-ebike-map-card.js`) e vengono aggiornate automaticamente insieme all'integrazione. Dopo un aggiornamento di versione tramite HACS o Marketplace esegui un hard reload della cache del browser, altrimenti il selettore delle card potrebbe non mostrare ancora una nuova card.
 
-#### Installazione tramite HACS (alternativa)
+#### Installazione tramite Marketplace o HACS (alternativa)
+
+**Manualmente nel Marketplace** (da Home Assistant 2026.11, sostituisce HACS):
+
+1. Apri **Impostazioni → Marketplace**. Alla prima apertura devi accettare l'avviso.
+2. Clicca in alto a destra su **Aggiungi dal collegamento**
+3. Inserisci `https://github.com/Xunil99/ha-bosch-ebike` in **Collegamento GitHub** e clicca su **Aggiungi**. Serve una connessione a GitHub, il Marketplace la richiede.
+4. Se il **Tipo** non viene riconosciuto, scegli **Integrazione** e clicca di nuovo su **Aggiungi**
+5. Apri il repository nel Marketplace, clicca su **Installa** e riavvia Home Assistant
+
+Se avevi installato l'integrazione con HACS: al primo avvio con Home Assistant 2026.11 il Marketplace rileva automaticamente i tuoi contenuti HACS, aggiornamenti inclusi, e HACS viene rimosso.
+
+**Manualmente con HACS** (Home Assistant fino alla 2026.10):
 
 1. Apri HACS in Home Assistant
 2. Clicca su **"Repository personalizzati"** (tre puntini in alto a destra)
@@ -209,7 +221,9 @@ L'integrazione supporta sia più account sia più bici per account.
 
 **Più bici sotto un unico account** (ad es. due bici con la stessa SingleKey ID):
 - L'integrazione crea automaticamente sensori separati per ogni bici (drive unit, batteria, service ecc.).
-- I tour vengono assegnati automaticamente alla bici giusta tramite un'euristica (confronto del valore `odometer` specifico della bici con `startOdometer + distance` del rispettivo tour).
+- I tour vengono assegnati alla bici il cui `bikeId` Bosch fornisce insieme al tour. Se manca o non appartiene a nessuna bici dell'account, subentra un'euristica (confronto del valore `odometer` specifico della bici con `startOdometer + distance` del rispettivo tour).
+
+**Integrare le bici separatamente** (Smart System, alternativa all'assegnazione automatica): Bosch condivide i dati per bici e per app (passo 5 dell'installazione). Se per lo stesso account registri due app, ciascuna con una propria Client-ID, e nell'eBike Manager condividi ogni bici con una sola delle due app, in Home Assistant ottieni due istanze con una bici ciascuna. Ogni tour appartiene allora chiaramente alla propria bici e non resta nulla da assegnare. Procedi come descritto in **Più account Bosch**, ma accedi con lo stesso account Bosch per entrambe le istanze. Consiglio di [@JulianHock](https://github.com/JulianHock).
 
 **Filtri nella card:** Non appena è presente più di un account e/o più di una bici, la card Lovelace mostra automaticamente due campi di selezione sopra la lista:
 - **Account** (visibile solo con più account)
@@ -323,6 +337,8 @@ di storico dei tour):
 > sensore (`wh_per_km`, `tours_used`, `window_km`). Finché sono disponibili
 > meno di 3 tour o 30 km di dati di consumo, i sensori restano vuoti.
 
+I tour la cui energia registrata è irrealisticamente bassa (sotto 2,5 Wh/km, oppure 0 Wh, di solito perché è stata rilevata solo in parte) vengono ignorati nella stima, perché farebbero sembrare l'autonomia troppo alta. Gli attributi `tours_ignored` e `tours_ignored_sample` mostrano quanti e quali sono, ciascuno con la fonte della sua energia (`cloud` = il contatore di energia del cloud Bosch, `ble_live` = il livello batteria live della bridge); `tours_used_by_source` conta i tour utilizzati per fonte, `wh_per_km_min` e `wh_per_km_max` indicano il loro intervallo. Anche i tour sotto i 5 km non vengono usati: un tour breve dice poco sull'autonomia di uno lungo ed è il più difficile da misurare con precisione. `tours_too_short` li conta. Se quasi tutti i tour vengono esclusi, i sensori restano vuoti finché non ci sono abbastanza tour utilizzabili. L'autonomia ufficiale Bosch per modalità, e come unico valore (il sensore `Range Band`, ad esempio «37–80 km»), non ne risente.
+
 ### Riepilogo della sessione di ricarica
 
 Il cloud Bosch non conosce affatto il concetto di ricarica: comunica solo il livello di carica al momento dell'ultima sincronizzazione. Chi invece utilizza la [bridge ESPHome LDI](https://github.com/Xunil99/ha-bosch-ebike/tree/main/esphome) dispone di un **livello di carica live**, e tanto basta per ricostruire l'intera ricarica.
@@ -426,6 +442,8 @@ bike_id: bike-uuid-1
 ```
 
 Fasce di colore per giorno: vuoto, 1-10 km, 10-25 km, 25-50 km, 50+ km. I colori provengono dalle variabili del tema HA: i temi chiari assomigliano a GitHub light, in modalità scura viene caricata automaticamente la palette scura adatta.
+
+> **Progetti correlati:** Vuoi altre statistiche? [ebike-cards](https://github.com/JulianHock/ebike-cards) di [@JulianHock](https://github.com/JulianHock) completa queste card con statistiche delle uscite per settimana, mese o anno (anche tempo di guida e calorie), il confronto tra più bici, i trick per bici, l'ultima uscita, i record e un obiettivo annuale. Le card richiedono solo questa integrazione, si installano tramite Marketplace o HACS come repository personalizzato (categoria Dashboard) e per ora sono etichettate in tedesco. [Apri nel Marketplace o in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=JulianHock&repository=ebike-cards&category=plugin)
 
 ### Mappa 3D – inseguimento chase-cam con slider temporale e posizione del sole
 
@@ -555,6 +573,7 @@ Sulla card Lovelace c'è un toggle 📚 nei controlli della mappa. Se attivato, 
 | Nessuna entità dopo la configurazione | Attivare l'interruttore di condivisione dati nell'eBike Manager (passo 5) |
 | BES2: successo segnalato, ma 0 bici | Attivare la condivisione dati tramite il link eBike Connect indicato sopra |
 | "Client non trovato" al login | Usare "Service aktivieren" nell'eBike Manager (passo 4) e controllare errori di battitura/spazi nella Client-ID |
+| "Configurazione non riuscita, riproverà" dopo un riavvio, oppure la Client-ID non esiste più presso Bosch | Da v1.19.64 Home Assistant chiede di accedere di nuovo (Impostazioni → Dispositivi e servizi → Bosch eBike). Lì si può modificare la Client-ID: se l'app non esiste più nel portale, registra prima una nuova app (passo 1) e inserisci la sua Client-ID. Entità e impostazioni vengono mantenute |
 | "Invalid state" / il ritorno fallisce | "My Home Assistant" è attivato in HA? La Redirect URI nel portale deve essere `https://my.home-assistant.io/redirect/oauth` |
 | "Invalid parameters are given" cliccando su "Service aktivieren", oppure "Invalid parameter: redirect_uri" da Bosch durante l'autorizzazione | Hai scambiato Redirect URI e Login URL nel portale Bosch? Controlla il passo 1 - sono entrambi indirizzi `my.home-assistant.io` e si somigliano; ogni valore deve stare nel campo con il nome corrispondente |
 | Chilometraggio irrealisticamente alto | L'odometro viene fornito in metri e convertito automaticamente in km |
@@ -631,6 +650,7 @@ Queste entità compaiono **automaticamente** con la normale configurazione. **No
 | Entità | Tipo/unità | Descrizione |
 |--------|------------|-------------|
 | Reachable Range {Eco/Tour/eMTB/Turbo} | sensor / km | Stima ufficiale Bosch dell'autonomia per modalità di assistenza (un sensore per modalità attiva) |
+| Range Band | sensor / testo | Gli stessi valori Bosch come unico valore, dalla modalità di assistenza più bassa alla più alta (ad esempio «37–80 km»), come nell'app Flow |
 | Next Service Date | sensor / data | Prossimo tagliando come data (integra il Next Service Odometer in km) |
 | State of Health | sensor / % | Stato di salute della batteria per ogni batteria, dal libretto di servizio digitale |
 | Measured Capacity | sensor / Wh | Capacità della batteria misurata dal rivenditore, per ogni batteria |
@@ -662,5 +682,7 @@ Licenza MIT – vedi [LICENSE](LICENSE) per i dettagli.
 ### Crediti
 
 Creato da [Volker Hauffe](https://github.com/Xunil99).
+
+**Julian ([@JulianHock](https://github.com/JulianHock)) ha creato le card complementari [ebike-cards](https://github.com/JulianHock/ebike-cards) e corretto le durate del Trick Check ([PR #93](https://github.com/Xunil99/ha-bosch-ebike/pull/93)).** Grazie!
 
 Questa integrazione utilizza l'API ufficiale [Bosch eBike Data Act](https://portal.bosch-ebike.com/data-act).
