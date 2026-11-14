@@ -7,8 +7,8 @@ ID. Every entity's unique_id is built from that bike ID, so the second config
 entry's entities collided with the first entry's and Home Assistant dropped
 them all.
 
-No Home Assistant imports: entities and devices are duck-typed so the logic
-stays testable with plain fakes (tests/test_shared_bike.py).
+No Home Assistant imports: entities and registry entries are duck-typed so the
+logic stays testable with plain fakes (tests/test_shared_bike.py).
 """
 from __future__ import annotations
 
@@ -18,62 +18,76 @@ from typing import Any, Iterable
 _LOGGER = logging.getLogger(__name__)
 
 
+def unique_ids_of_other_entries(
+    registry_entries: Iterable[Any], *, entry_id: str, domain: str
+) -> set[str]:
+    """Return this integration's unique_ids registered to other config entries.
+
+    The entity registry is what a colliding unique_id collides with, so it is
+    the one reliable witness of who got there first. Device ownership is not:
+    since Home Assistant 2026.11 a device belongs to a single config entry, so
+    both accounts can own a device for the same bike.
+    """
+    return {
+        e.unique_id
+        for e in registry_entries
+        if e.platform == domain and e.config_entry_id != entry_id
+    }
+
+
 def scope_shared_bike_entities(
     entities: list[Any],
-    devices: Iterable[Any],
+    taken_unique_ids: set[str],
     *,
     entry_id: str,
     account_label: str,
     domain: str,
 ) -> list[Any]:
-    """Re-scope entities of bikes already claimed by another config entry."""
-    claimed = {
-        ident
-        for device in devices
-        if entry_id not in device.config_entries
-        for ident in _own_identifiers(device.identifiers, domain)
-    }
+    """Re-scope entities whose unique_id another config entry already holds."""
     for entity in entities:
-        bike_ids = _own_identifiers(
-            entity._attr_device_info["identifiers"], domain
-        ) & claimed
-        if not bike_ids:
+        if entity._attr_unique_id not in taken_unique_ids:
             continue
-        bike_id = bike_ids.pop()
         entity._attr_unique_id = f"{entry_id}_{entity._attr_unique_id}"
         device_info = entity._attr_device_info
-        device_info["identifiers"] = {(domain, f"{bike_id}_{entry_id}")}
+        device_info["identifiers"] = {
+            (domain, f"{t[1]}_{entry_id}") if _is_own(t, domain) else t
+            for t in device_info["identifiers"]
+        }
         if device_info.get("name"):
             device_info["name"] = f"{device_info['name']} ({account_label})"
     return entities
 
 
-def _own_identifiers(identifiers: Iterable[tuple], domain: str) -> set[str]:
-    """Return the ids of this domain's (domain, id) pairs.
+def _is_own(identifier: tuple, domain: str) -> bool:
+    """True for this domain's (domain, id) pairs.
 
-    Other integrations may register identifiers that are not pairs, so never
-    unpack blindly - one foreign three-part identifier would otherwise break
-    every platform's setup.
+    Identifiers are not guaranteed to be pairs, so never unpack blindly - one
+    three-part identifier would otherwise break every platform's setup.
     """
-    return {t[1] for t in identifiers if len(t) == 2 and t[0] == domain}
+    return len(identifier) == 2 and identifier[0] == domain
 
 
 def scope_for_entry(hass: Any, entry: Any, entities: list[Any]) -> list[Any]:
-    """Apply scope_shared_bike_entities() against the live device registry.
+    """Apply scope_shared_bike_entities() against the live entity registry.
 
-    Called by every platform right before async_add_entities(). The bike's
-    device already belonging to another entry is what marks this entry as a
-    second account on a shared bike; the main user's entry owns that device
-    and is therefore never re-scoped.
+    Called by every platform right before async_add_entities(). The entry
+    whose entities already hold the plain unique_ids (the main user's, set up
+    first) keeps them and their history; any other entry reporting the same
+    bike gets entry-scoped unique_ids and its own device.
     """
-    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
 
     from .const import DOMAIN
 
     try:
+        taken = unique_ids_of_other_entries(
+            er.async_get(hass).entities.values(),
+            entry_id=entry.entry_id,
+            domain=DOMAIN,
+        )
         return scope_shared_bike_entities(
             entities,
-            iter(dr.async_get(hass).devices),
+            taken,
             entry_id=entry.entry_id,
             account_label=entry.title or entry.entry_id[:8],
             domain=DOMAIN,

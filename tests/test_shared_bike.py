@@ -6,8 +6,8 @@ ID, so every entity of the second entry used to collide on its unique_id
 ("does not generate unique IDs ... already exists - ignoring") and the second
 account's rides never showed up in Home Assistant.
 
-shared_bike.py has no Home Assistant imports; entities and devices are passed
-in as plain objects, so these tests use small fakes instead of HA.
+shared_bike.py has no Home Assistant imports; entities and registry entries
+are passed in as plain objects, so these tests use small fakes instead of HA.
 """
 import importlib.util
 from pathlib import Path
@@ -20,9 +20,11 @@ _spec = importlib.util.spec_from_file_location("shared_bike", _MODULE_PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 scope_shared_bike_entities = _mod.scope_shared_bike_entities
+unique_ids_of_other_entries = _mod.unique_ids_of_other_entries
 
 DOMAIN = "ha_bosch_ebike"
 BIKE = "bike-1"
+UID = f"{BIKE}_last_ride_distance"
 
 
 class FakeEntity:
@@ -31,70 +33,94 @@ class FakeEntity:
         self._attr_device_info = {"identifiers": {(DOMAIN, identifier)}, "name": name}
 
 
-class FakeDevice:
-    def __init__(self, identifier, config_entries):
-        self.identifiers = {(DOMAIN, identifier)}
-        self.config_entries = set(config_entries)
+class FakeRegistryEntry:
+    def __init__(self, unique_id, config_entry_id, platform=DOMAIN):
+        self.unique_id = unique_id
+        self.config_entry_id = config_entry_id
+        self.platform = platform
 
 
-def _scope(entities, devices, entry_id="entry-b", label="Anne"):
+def _scope(entities, taken, entry_id="entry-b", label="Anne"):
     return scope_shared_bike_entities(
-        entities, devices, entry_id=entry_id, account_label=label, domain=DOMAIN
+        entities, set(taken), entry_id=entry_id, account_label=label, domain=DOMAIN
     )
 
 
-def test_bike_without_existing_device_is_left_alone():
-    entity = FakeEntity(f"{BIKE}_last_ride_distance", BIKE)
-    _scope([entity], devices=[])
-    assert entity._attr_unique_id == f"{BIKE}_last_ride_distance"
+def test_bike_nobody_else_registered_is_left_alone():
+    entity = FakeEntity(UID, BIKE)
+    _scope([entity], taken=[])
+    assert entity._attr_unique_id == UID
     assert entity._attr_device_info["identifiers"] == {(DOMAIN, BIKE)}
 
 
-def test_bike_claimed_by_another_entry_gets_entry_scoped_unique_id():
-    entity = FakeEntity(f"{BIKE}_last_ride_distance", BIKE)
-    _scope([entity], devices=[FakeDevice(BIKE, ["entry-a"])], entry_id="entry-b")
-    assert entity._attr_unique_id == f"entry-b_{BIKE}_last_ride_distance"
+def test_unique_id_taken_by_another_entry_gets_entry_scoped():
+    entity = FakeEntity(UID, BIKE)
+    _scope([entity], taken=[UID], entry_id="entry-b")
+    assert entity._attr_unique_id == f"entry-b_{UID}"
 
 
-def test_bike_claimed_by_another_entry_gets_its_own_device():
-    entity = FakeEntity(f"{BIKE}_last_ride_distance", BIKE)
-    _scope([entity], devices=[FakeDevice(BIKE, ["entry-a"])], entry_id="entry-b")
+def test_scoped_entity_gets_its_own_device():
+    entity = FakeEntity(UID, BIKE)
+    _scope([entity], taken=[UID], entry_id="entry-b")
     assert entity._attr_device_info["identifiers"] == {(DOMAIN, f"{BIKE}_entry-b")}
 
 
 def test_own_device_name_carries_the_account_label():
-    entity = FakeEntity(f"{BIKE}_last_ride_distance", BIKE, name="Cargo Line")
-    _scope([entity], devices=[FakeDevice(BIKE, ["entry-a"])], label="Anne")
+    entity = FakeEntity(UID, BIKE, name="Cargo Line")
+    _scope([entity], taken=[UID], label="Anne")
     assert entity._attr_device_info["name"] == "Cargo Line (Anne)"
-
-
-def test_entry_that_owns_the_bike_device_keeps_its_unique_ids():
-    # The main user's entry must never be re-scoped: that would orphan all of
-    # its existing entities and their history.
-    entity = FakeEntity(f"{BIKE}_last_ride_distance", BIKE)
-    _scope([entity], devices=[FakeDevice(BIKE, ["entry-a"])], entry_id="entry-a")
-    assert entity._attr_unique_id == f"{BIKE}_last_ride_distance"
-    assert entity._attr_device_info["identifiers"] == {(DOMAIN, BIKE)}
 
 
 def test_account_level_entity_of_the_second_entry_is_left_alone():
     # The unassigned-activities sensor hangs off a per-entry account device,
     # not off a bike, so it never collides and must not be touched.
     entity = FakeEntity("entry-b_unassigned_activities", "entry-b", name="Account")
-    _scope([entity], devices=[FakeDevice(BIKE, ["entry-a"])], entry_id="entry-b")
+    _scope([entity], taken=[UID], entry_id="entry-b")
     assert entity._attr_unique_id == "entry-b_unassigned_activities"
     assert entity._attr_device_info["name"] == "Account"
 
 
-def test_foreign_device_with_three_part_identifier_does_not_break_setup():
-    # Other integrations may register identifiers that are not (domain, id)
-    # pairs. Unpacking every identifier as a pair raised "too many values to
-    # unpack" and took down every platform of every entry on a real install.
-    foreign = FakeDevice(BIKE, ["entry-a"])
-    foreign.identifiers = {("some_other_domain", "hub", "node-7")}
-    entity = FakeEntity(f"{BIKE}_last_ride_distance", BIKE)
-    _scope([entity], devices=[foreign, FakeDevice(BIKE, ["entry-a"])])
-    assert entity._attr_unique_id == f"entry-b_{BIKE}_last_ride_distance"
+def test_entity_with_three_part_device_identifier_does_not_break_setup():
+    # Identifiers are not guaranteed to be (domain, id) pairs. Unpacking every
+    # identifier as a pair raised "too many values to unpack" and took down
+    # every platform of every entry on a real install.
+    entity = FakeEntity(UID, BIKE)
+    entity._attr_device_info["identifiers"].add(("some_other_domain", "hub", "node-7"))
+    _scope([entity], taken=[UID])
+    assert entity._attr_unique_id == f"entry-b_{UID}"
+    assert (DOMAIN, f"{BIKE}_entry-b") in entity._attr_device_info["identifiers"]
+
+
+def test_other_entries_unique_ids_exclude_the_entrys_own():
+    # The main user's entry must never be re-scoped: that would orphan all of
+    # its existing entities and their history. Its own registered unique_ids
+    # therefore never count as "taken" for itself.
+    registry = [FakeRegistryEntry(UID, "entry-a")]
+    assert unique_ids_of_other_entries(registry, entry_id="entry-a", domain=DOMAIN) == set()
+    assert unique_ids_of_other_entries(registry, entry_id="entry-b", domain=DOMAIN) == {UID}
+
+
+def test_other_integrations_entities_do_not_count_as_taken():
+    registry = [FakeRegistryEntry(UID, "entry-x", platform="some_other_domain")]
+    assert unique_ids_of_other_entries(registry, entry_id="entry-b", domain=DOMAIN) == set()
+
+
+def test_main_entry_keeps_ids_even_if_the_other_entry_owns_a_same_bike_device():
+    # Since Home Assistant 2026.11 a device belongs to exactly one config
+    # entry, so both entries can own a device for the same bike. Deciding by
+    # device ownership then re-scoped BOTH entries and orphaned the main
+    # user's entities. Ownership of the registered unique_ids is what counts.
+    registry = [
+        FakeRegistryEntry(UID, "entry-a"),
+        FakeRegistryEntry(f"entry-b_{UID}", "entry-b"),
+    ]
+    main = FakeEntity(UID, BIKE)
+    second = FakeEntity(UID, BIKE)
+    _scope([main], unique_ids_of_other_entries(registry, entry_id="entry-a", domain=DOMAIN), entry_id="entry-a")
+    _scope([second], unique_ids_of_other_entries(registry, entry_id="entry-b", domain=DOMAIN), entry_id="entry-b")
+    assert main._attr_unique_id == UID
+    assert main._attr_device_info["identifiers"] == {(DOMAIN, BIKE)}
+    assert second._attr_unique_id == f"entry-b_{UID}"
 
 
 if __name__ == "__main__":
