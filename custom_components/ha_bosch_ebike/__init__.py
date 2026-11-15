@@ -44,7 +44,7 @@ from .const import (
     CONF_BES2_PART,
 )
 from .coordinator import BoschEBikeCoordinator
-from .device_lookup import device_for_identifier
+from .device_lookup import device_for_bike, device_for_identifier
 from .profile_extra import bike_label as _bike_label
 
 _LOGGER = logging.getLogger(__name__)
@@ -345,6 +345,15 @@ def _make_update_listener(entry: ConfigEntry):
     return _async_entry_updated
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Clear this entry's repair issue when the entry is deleted (a reload keeps it)."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from .no_bikes import issue_id
+
+    ir.async_delete_issue(hass, DOMAIN, issue_id(entry.entry_id))
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
@@ -404,7 +413,7 @@ async def ws_list_instances(
             # editors, since they all resolve their options through this
             # same WS call. Mirrors BoschEBikeOptionsFlowHandler's
             # _display_name_for_bike() in config_flow.py.
-            device = device_for_identifier(device_registry, (DOMAIN, bid), entry_id)
+            device = device_for_bike(device_registry, DOMAIN, bid, entry_id)
             if device and (device.name_by_user or device.name):
                 label = device.name_by_user or device.name
             else:

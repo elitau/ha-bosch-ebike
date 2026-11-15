@@ -40,7 +40,7 @@ class FakeRegistryEntry:
         self.platform = platform
 
 
-def _scope(entities, taken, entry_id="entry-b", label="Anne"):
+def _scope(entities, taken, entry_id="entry-b", label="Sam"):
     return scope_shared_bike_entities(
         entities, set(taken), entry_id=entry_id, account_label=label, domain=DOMAIN
     )
@@ -77,8 +77,8 @@ def test_scoped_entity_gets_its_own_device():
 
 def test_own_device_name_carries_the_account_label():
     entity = FakeEntity(UID, BIKE, name="Cargo Line")
-    _scope([entity], taken=[UID], label="Anne")
-    assert entity._attr_device_info["name"] == "Cargo Line (Anne)"
+    _scope([entity], taken=[UID], label="Sam")
+    assert entity._attr_device_info["name"] == "Cargo Line (Sam)"
 
 
 def test_account_level_entity_of_the_second_entry_is_left_alone():
