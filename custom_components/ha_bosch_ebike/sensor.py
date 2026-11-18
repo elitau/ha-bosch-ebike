@@ -82,6 +82,20 @@ def _safe_get(data: dict, *keys: str, default: Any = None) -> Any:
     return data
 
 
+def _battery_at(bike: dict, index: int) -> dict:
+    """The battery at this position in the bike data of the current poll, or {}.
+
+    The per-battery sensors are created once, but their values change with
+    every ride and every charge, so they look the battery up in the bike they
+    are handed on each update. The position is what their unique ID is built
+    from (battery_1, battery_2), so it names the same battery on every poll.
+    """
+    batteries = (bike or {}).get("batteries") or []
+    if 0 <= index < len(batteries) and isinstance(batteries[index], dict):
+        return batteries[index]
+    return {}
+
+
 def _parse_timestamp(value: str | None) -> datetime | None:
     """Parse Bosch API timestamp strings into datetime objects for HA."""
     if not value or not isinstance(value, str):
@@ -765,7 +779,7 @@ async def async_setup_entry(
 
             if not is_bes2:
                 entities.extend(
-                    _create_battery_sensors(coordinator, bike_id, drive_name, battery, bat_prefix, bat_name)
+                    _create_battery_sensors(coordinator, bike_id, drive_name, idx, bat_prefix, bat_name)
                 )
 
                 # State-of-Health sensors from the service book (dealer capacity
@@ -982,11 +996,15 @@ def _create_battery_sensors(
     coordinator: BoschEBikeCoordinator,
     bike_id: str,
     drive_name: str,
-    battery: dict,
+    battery_index: int,
     prefix: str,
     bat_name: str,
 ) -> list[BoschEBikeSensor]:
     """Create sensor entities for a single battery.
+
+    The values are read from the bike of the current poll (see _battery_at),
+    not from the battery as it was at setup: that froze Wh Lifetime and the
+    charge cycles until the entry was loaded again.
 
     The translation keys are there so that a card (or any script reading the
     entity registry) can find these sensors without relying on their entity
@@ -1009,7 +1027,7 @@ def _create_battery_sensors(
             device_class=SensorDeviceClass.ENERGY,
             state_class=SensorStateClass.TOTAL_INCREASING,
             icon="mdi:battery-charging",
-            value_fn=lambda d, b=battery: b.get("deliveredWhOverLifetime"),
+            value_fn=lambda d, i=battery_index: _battery_at(d, i).get("deliveredWhOverLifetime"),
         ),
         BoschBikeSensorDescription(
             key=f"{prefix}_charge_cycles_total",
@@ -1017,7 +1035,7 @@ def _create_battery_sensors(
             name=f"{bat_name} Charge Cycles",
             icon="mdi:battery-sync",
             state_class=SensorStateClass.TOTAL_INCREASING,
-            value_fn=lambda d, b=battery: _safe_get(b, "chargeCycles", "total"),
+            value_fn=lambda d, i=battery_index: _safe_get(_battery_at(d, i), "chargeCycles", "total"),
         ),
         BoschBikeSensorDescription(
             key=f"{prefix}_charge_cycles_on_bike",
@@ -1025,7 +1043,7 @@ def _create_battery_sensors(
             name=f"{bat_name} Cycles On Bike",
             icon="mdi:battery-sync",
             state_class=SensorStateClass.TOTAL_INCREASING,
-            value_fn=lambda d, b=battery: _safe_get(b, "chargeCycles", "onBike"),
+            value_fn=lambda d, i=battery_index: _safe_get(_battery_at(d, i), "chargeCycles", "onBike"),
         ),
         BoschBikeSensorDescription(
             key=f"{prefix}_charge_cycles_off_bike",
@@ -1033,7 +1051,7 @@ def _create_battery_sensors(
             name=f"{bat_name} Cycles Off Bike",
             icon="mdi:battery-sync",
             state_class=SensorStateClass.TOTAL_INCREASING,
-            value_fn=lambda d, b=battery: _safe_get(b, "chargeCycles", "offBike"),
+            value_fn=lambda d, i=battery_index: _safe_get(_battery_at(d, i), "chargeCycles", "offBike"),
         ),
     ]
     return [BoschEBikeSensor(coordinator, desc, bike_id, drive_name) for desc in descs]
